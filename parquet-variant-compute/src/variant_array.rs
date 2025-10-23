@@ -19,7 +19,7 @@
 
 use crate::VariantArrayBuilder;
 use crate::type_conversion::{generic_conversion_single_value, primitive_conversion_single_value};
-use arrow::array::{Array, ArrayRef, AsArray, BinaryViewArray, StructArray};
+use arrow::array::{Array, ArrayRef, AsArray, BinaryArray, BinaryViewArray, StructArray};
 use arrow::buffer::NullBuffer;
 use arrow::compute::cast;
 use arrow::datatypes::{
@@ -34,6 +34,7 @@ use parquet_variant::{
     Uuid, Variant, VariantDecimal4, VariantDecimal8, VariantDecimal16, VariantDecimalType as _,
 };
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -75,6 +76,161 @@ impl ExtensionType for VariantType {
     fn try_new(data_type: &DataType, _metadata: Self::Metadata) -> Result<Self, ArrowError> {
         Self.supports_data_type(data_type)?;
         Ok(Self)
+    }
+}
+
+/// Enum to hold either BinaryArray or BinaryViewArray
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinaryLikeArray {
+    Binary(BinaryArray),
+    BinaryView(BinaryViewArray),
+}
+
+impl BinaryLikeArray {
+    /// Get the value at the given index as bytes
+    pub fn value(&self, index: usize) -> &[u8] {
+        match self {
+            BinaryLikeArray::Binary(array) => array.value(index),
+            BinaryLikeArray::BinaryView(array) => array.value(index),
+        }
+    }
+
+    /// Slice the array returning the same type
+    pub fn slice(&self, offset: usize, length: usize) -> Self {
+        match self {
+            BinaryLikeArray::Binary(array) => BinaryLikeArray::Binary(array.slice(offset, length)),
+            BinaryLikeArray::BinaryView(array) => {
+                BinaryLikeArray::BinaryView(array.slice(offset, length))
+            }
+        }
+    }
+
+    /// Convert to BinaryViewArray, potentially requiring a copy if this is a BinaryArray
+    pub fn to_binary_view(&self) -> Cow<'_, BinaryViewArray> {
+        match self {
+            BinaryLikeArray::Binary(array) => {
+                // Need to convert BinaryArray to BinaryViewArray
+                let array_ref: ArrayRef = Arc::new(array.clone());
+                let casted = cast(&array_ref, &DataType::BinaryView)
+                    .expect("cast to BinaryView should succeed");
+                Cow::Owned(casted.as_binary_view().clone())
+            }
+            BinaryLikeArray::BinaryView(array) => Cow::Borrowed(array),
+        }
+    }
+
+    /// Get a reference to the underlying BinaryViewArray if this is one, otherwise None
+    pub fn as_binary_view(&self) -> Option<&BinaryViewArray> {
+        match self {
+            BinaryLikeArray::Binary(_) => None,
+            BinaryLikeArray::BinaryView(array) => Some(array),
+        }
+    }
+
+
+    /// Clone as BinaryViewArray, converting if necessary
+    pub fn clone_as_binary_view(&self) -> BinaryViewArray {
+        match self {
+            BinaryLikeArray::Binary(array) => {
+                // Convert BinaryArray to BinaryViewArray
+                let array_ref: ArrayRef = Arc::new(array.clone());
+                cast(&array_ref, &DataType::BinaryView)
+                    .expect("cast to BinaryView should succeed")
+                    .as_binary_view()
+                    .clone()
+            }
+            BinaryLikeArray::BinaryView(array) => array.clone(),
+        }
+    }
+
+    /// Get as BinaryViewArray reference, converting if necessary.
+    /// Returns an owned BinaryViewArray if this is a BinaryArray that needs conversion.
+    pub fn as_binary_view_cow(&self) -> Cow<'_, BinaryViewArray> {
+        match self {
+            BinaryLikeArray::Binary(array) => {
+                // Convert BinaryArray to BinaryViewArray
+                let array_ref: ArrayRef = Arc::new(array.clone());
+                let casted = cast(&array_ref, &DataType::BinaryView)
+                    .expect("cast to BinaryView should succeed")
+                    .as_binary_view()
+                    .clone();
+                Cow::Owned(casted)
+            }
+            BinaryLikeArray::BinaryView(array) => Cow::Borrowed(array),
+        }
+    }
+}
+
+impl Array for BinaryLikeArray {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn to_data(&self) -> arrow::array::ArrayData {
+        match self {
+            BinaryLikeArray::Binary(array) => array.to_data(),
+            BinaryLikeArray::BinaryView(array) => array.to_data(),
+        }
+    }
+
+    fn into_data(self) -> arrow::array::ArrayData {
+        match self {
+            BinaryLikeArray::Binary(array) => array.into_data(),
+            BinaryLikeArray::BinaryView(array) => array.into_data(),
+        }
+    }
+
+    fn data_type(&self) -> &DataType {
+        match self {
+            BinaryLikeArray::Binary(array) => array.data_type(),
+            BinaryLikeArray::BinaryView(array) => array.data_type(),
+        }
+    }
+
+    fn slice(&self, offset: usize, length: usize) -> ArrayRef {
+        match self {
+            BinaryLikeArray::Binary(array) => Arc::new(array.slice(offset, length)),
+            BinaryLikeArray::BinaryView(array) => Arc::new(array.slice(offset, length)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            BinaryLikeArray::Binary(array) => array.len(),
+            BinaryLikeArray::BinaryView(array) => array.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn offset(&self) -> usize {
+        match self {
+            BinaryLikeArray::Binary(array) => array.offset(),
+            BinaryLikeArray::BinaryView(array) => array.offset(),
+        }
+    }
+
+    fn nulls(&self) -> Option<&NullBuffer> {
+        match self {
+            BinaryLikeArray::Binary(array) => array.nulls(),
+            BinaryLikeArray::BinaryView(array) => array.nulls(),
+        }
+    }
+
+    fn get_buffer_memory_size(&self) -> usize {
+        match self {
+            BinaryLikeArray::Binary(array) => array.get_buffer_memory_size(),
+            BinaryLikeArray::BinaryView(array) => array.get_buffer_memory_size(),
+        }
+    }
+
+    fn get_array_memory_size(&self) -> usize {
+        match self {
+            BinaryLikeArray::Binary(array) => array.get_array_memory_size(),
+            BinaryLikeArray::BinaryView(array) => array.get_array_memory_size(),
+        }
     }
 }
 
@@ -215,7 +371,7 @@ pub struct VariantArray {
     inner: StructArray,
 
     /// The metadata column of this variant
-    metadata: BinaryViewArray,
+    metadata: BinaryLikeArray,
 
     /// how is this variant array shredded?
     shredding_state: ShreddingState,
@@ -248,49 +404,93 @@ impl VariantArray {
     /// Dictionary-Encoded, preferably (but not required) with an index type of
     /// int8.
     ///
-    /// Currently, only [`BinaryViewArray`] are supported.
+    /// Both [`BinaryArray`] and [`BinaryViewArray`] are supported for metadata and value fields.
     pub fn try_new(inner: &dyn Array) -> Result<Self, ArrowError> {
-        // Workaround lack of support for Binary
-        // https://github.com/apache/arrow-rs/issues/8387
-        let inner = cast_to_binary_view_arrays(inner)?;
+        // First check if we need to cast
+        let (inner_struct, metadata) = match inner.as_struct_opt() {
+            Some(struct_array) => {
+                // Check the metadata field type
+                let Some(metadata_field) = struct_array.column_by_name("metadata") else {
+                    return Err(ArrowError::InvalidArgumentError(
+                        "Invalid VariantArray: StructArray must contain a 'metadata' field"
+                            .to_string(),
+                    ));
+                };
 
-        let Some(inner) = inner.as_struct_opt() else {
-            return Err(ArrowError::InvalidArgumentError(
-                "Invalid VariantArray: requires StructArray as input".to_string(),
-            ));
-        };
-
-        // Note the specification allows for any order so we must search by name
-
-        // Ensure the StructArray has a metadata field of BinaryView
-        let Some(metadata_field) = inner.column_by_name("metadata") else {
-            return Err(ArrowError::InvalidArgumentError(
-                "Invalid VariantArray: StructArray must contain a 'metadata' field".to_string(),
-            ));
-        };
-        let Some(metadata) = metadata_field.as_binary_view_opt() else {
-            return Err(ArrowError::NotYetImplemented(format!(
-                "VariantArray 'metadata' field must be BinaryView, got {}",
-                metadata_field.data_type()
-            )));
+                match metadata_field.data_type() {
+                    DataType::Binary => {
+                        let Some(binary_array) = metadata_field.as_binary_opt::<i32>() else {
+                            return Err(ArrowError::InvalidArgumentError(
+                                "Failed to cast metadata field to BinaryArray".to_string(),
+                            ));
+                        };
+                        (struct_array, BinaryLikeArray::Binary(binary_array.clone()))
+                    }
+                    DataType::BinaryView => {
+                        let Some(binary_view_array) = metadata_field.as_binary_view_opt() else {
+                            return Err(ArrowError::InvalidArgumentError(
+                                "Failed to cast metadata field to BinaryViewArray".to_string(),
+                            ));
+                        };
+                        (
+                            struct_array,
+                            BinaryLikeArray::BinaryView(binary_view_array.clone()),
+                        )
+                    }
+                    _ => {
+                        // Need to cast to BinaryView
+                        return match cast_to_binary_view_arrays(inner)?.as_struct_opt() {
+                            Some(casted_struct) => {
+                                let metadata_field =
+                                    casted_struct.column_by_name("metadata").ok_or_else(|| {
+                                        ArrowError::InvalidArgumentError(
+                                            "Metadata field missing after cast".to_string(),
+                                        )
+                                    })?;
+                                let binary_view_array = metadata_field.as_binary_view_opt()
+                                    .ok_or_else(|| ArrowError::NotYetImplemented(format!(
+                                        "VariantArray 'metadata' field must be Binary or BinaryView, got {}",
+                                        metadata_field.data_type()
+                                    )))?;
+                                Ok(Self {
+                                    inner: casted_struct.clone(),
+                                    metadata: BinaryLikeArray::BinaryView(
+                                        binary_view_array.clone(),
+                                    ),
+                                    shredding_state: ShreddingState::try_from(casted_struct)?,
+                                })
+                            }
+                            None => Err(ArrowError::InvalidArgumentError(
+                                "Failed to cast to struct array".to_string(),
+                            )),
+                        };
+                    }
+                }
+            }
+            None => {
+                return Err(ArrowError::InvalidArgumentError(
+                    "Invalid VariantArray: requires StructArray as input".to_string(),
+                ));
+            }
         };
 
         // Note these clones are cheap, they just bump the ref count
         Ok(Self {
-            inner: inner.clone(),
-            metadata: metadata.clone(),
-            shredding_state: ShreddingState::try_from(inner)?,
+            inner: inner_struct.clone(),
+            metadata,
+            shredding_state: ShreddingState::try_from(inner_struct)?,
         })
     }
 
     pub(crate) fn from_parts(
-        metadata: BinaryViewArray,
+        metadata: BinaryLikeArray,
         value: Option<BinaryViewArray>,
         typed_value: Option<ArrayRef>,
         nulls: Option<NullBuffer>,
     ) -> Self {
-        let mut builder =
-            StructArrayBuilder::new().with_field("metadata", Arc::new(metadata.clone()), false);
+        // Create the StructArray using BinaryLikeArray directly since it implements Array
+        let mut builder = StructArrayBuilder::new()
+            .with_field("metadata", Arc::new(metadata.clone()) as ArrayRef, false);
         if let Some(value) = value.clone() {
             builder = builder.with_field("value", Arc::new(value), true);
         }
@@ -360,7 +560,7 @@ impl VariantArray {
     }
 
     /// Return a reference to the metadata field of the [`StructArray`]
-    pub fn metadata_field(&self) -> &BinaryViewArray {
+    pub fn metadata_field(&self) -> &BinaryLikeArray {
         &self.metadata
     }
 
@@ -1269,7 +1469,7 @@ mod test {
         let err = VariantArray::try_new(&array);
         assert_eq!(
             err.unwrap_err().to_string(),
-            "Not yet implemented: VariantArray 'metadata' field must be BinaryView, got Int32"
+            "Not yet implemented: VariantArray 'metadata' field must be Binary or BinaryView, got Int32"
         );
     }
 
@@ -1534,5 +1734,53 @@ mod test {
             let v_sliced = v.slice(0, 1);
             assert_ne!(v, v_sliced);
         }
+    }
+
+    #[test]
+    fn test_binary_array_metadata_support() {
+        use arrow::array::BinaryArray;
+
+        // Create a VariantArrayBuilder to get valid metadata
+        let mut builder = VariantArrayBuilder::new(2);
+        builder.append_variant(Variant::from("test"));
+        builder.append_variant(Variant::from(42i32));
+        let temp_array = builder.build();
+        
+        // Extract valid metadata and value bytes
+        let metadata_bytes: Vec<&[u8]> = (0..temp_array.len())
+            .map(|i| temp_array.metadata_field().value(i))
+            .collect();
+        let value_bytes: Vec<&[u8]> = (0..temp_array.len())
+            .map(|i| temp_array.value_field().unwrap().value(i))
+            .collect();
+        
+        // Create a StructArray with BinaryArray metadata field
+        let metadata = BinaryArray::from(metadata_bytes);
+        let value = BinaryViewArray::from(value_bytes);
+
+        let fields = Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::BinaryView, true),
+        ]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::new(metadata), Arc::new(value)], None);
+
+        // Create VariantArray from the StructArray
+        let variant_array = VariantArray::try_new(&struct_array).unwrap();
+
+        // Verify the metadata is correctly stored as BinaryArray
+        match variant_array.metadata_field() {
+            BinaryLikeArray::Binary(_) => {
+                // Expected
+            }
+            BinaryLikeArray::BinaryView(_) => {
+                panic!("Expected BinaryArray metadata, got BinaryViewArray");
+            }
+        }
+
+        // Verify we can access values correctly
+        assert_eq!(variant_array.len(), 2);
+        assert_eq!(variant_array.value(0), Variant::from("test"));
+        assert_eq!(variant_array.value(1), Variant::from(42i32));
     }
 }

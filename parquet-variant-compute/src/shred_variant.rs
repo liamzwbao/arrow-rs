@@ -365,7 +365,7 @@ mod tests {
     fn test_all_null_input() {
         // Create VariantArray with no value field (all null case)
         let metadata = BinaryViewArray::from_iter_values([&[1u8, 0u8]]); // minimal valid metadata
-        let all_null_array = VariantArray::from_parts(metadata, None, None, None);
+        let all_null_array = VariantArray::from_parts(crate::BinaryLikeArray::BinaryView(metadata), None, None, None);
         let result = shred_variant(&all_null_array, &DataType::Int64).unwrap();
 
         // Should return array with no value/typed_value fields
@@ -597,7 +597,7 @@ mod tests {
         }
         fn get_value<'m, 'v>(
             i: usize,
-            metadata: &'m BinaryViewArray,
+            metadata: &'m BinaryLikeArray,
             value: &'v BinaryViewArray,
         ) -> Variant<'m, 'v> {
             Variant::new(metadata.value(i), value.value(i))

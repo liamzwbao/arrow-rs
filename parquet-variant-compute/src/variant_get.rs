@@ -132,8 +132,9 @@ fn shredded_get_path(
     let shred_basic_variant =
         |target: VariantArray, path: VariantPath<'_>, as_field: Option<&Field>| {
             let as_type = as_field.map(|f| f.data_type());
+            let metadata_view = target.metadata_field().as_binary_view_cow();
             let mut builder = make_variant_to_arrow_row_builder(
-                target.metadata_field(),
+                &metadata_view,
                 path,
                 as_type,
                 cast_options,
