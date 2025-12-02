@@ -264,13 +264,43 @@ impl<'a> VariantToShreddedArrayVariantRowBuilder<'a> {
         cast_options: &'a CastOptions,
         capacity: usize,
     ) -> Result<Self> {
+        let typed_value_builder =
+            match data_type {
+                DataType::List(field) => {
+                    ArrayVariantToArrowRowBuilder::try_new::<VariantToListArrowRowBuilder<'a, i32>>(
+                        field.clone(),
+                        field.data_type(),
+                        cast_options,
+                        capacity,
+                    )?
+                }
+                DataType::LargeList(field) => {
+                    ArrayVariantToArrowRowBuilder::try_new::<VariantToListArrowRowBuilder<'a, i64>>(
+                        field.clone(),
+                        field.data_type(),
+                        cast_options,
+                        capacity,
+                    )?
+                }
+                DataType::ListView(field) => {
+                    ArrayVariantToArrowRowBuilder::try_new::<
+                        VariantToListViewArrowRowBuilder<'a, i32>,
+                    >(field.clone(), field.data_type(), cast_options, capacity)?
+                }
+                DataType::LargeListView(field) => {
+                    ArrayVariantToArrowRowBuilder::try_new::<
+                        VariantToListViewArrowRowBuilder<'a, i64>,
+                    >(field.clone(), field.data_type(), cast_options, capacity)?
+                }
+                other => {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "Casting to {other:?} is not applicable for array Variant types"
+                    )));
+                }
+            };
         Ok(Self {
             value_builder: VariantValueArrayBuilder::new(capacity),
-            typed_value_builder: ArrayVariantToArrowRowBuilder::try_new(
-                data_type,
-                cast_options,
-                capacity,
-            )?,
+            typed_value_builder,
         })
     }
 
@@ -308,83 +338,51 @@ impl<'a> VariantToShreddedArrayVariantRowBuilder<'a> {
     }
 }
 
-enum ArrayVariantToArrowRowBuilder<'a> {
-    List(VariantToListArrowRowBuilder<'a, i32>),
-    LargeList(VariantToListArrowRowBuilder<'a, i64>),
-    ListView(VariantToListViewArrowRowBuilder<'a, i32>),
-    LargeListView(VariantToListViewArrowRowBuilder<'a, i64>),
+struct ArrayVariantToArrowRowBuilder<'a> {
+    builder: Box<dyn ListLikeArrayBuilder<'a> + 'a>,
 }
 
 impl<'a> ArrayVariantToArrowRowBuilder<'a> {
-    fn try_new(
-        data_type: &'a DataType,
+    fn try_new<B: ListLikeArrayBuilder<'a> + 'a>(
+        field: FieldRef,
+        element_data_type: &'a DataType,
         cast_options: &'a CastOptions,
         capacity: usize,
     ) -> Result<Self> {
-        use ArrayVariantToArrowRowBuilder::*;
-
-        let builder = match data_type {
-            DataType::List(field) => List(VariantToListArrowRowBuilder::try_new(
-                field.clone(),
-                field.data_type(),
-                cast_options,
-                capacity,
-            )?),
-            DataType::LargeList(field) => LargeList(VariantToListArrowRowBuilder::try_new(
-                field.clone(),
-                field.data_type(),
-                cast_options,
-                capacity,
-            )?),
-            DataType::ListView(field) => ListView(VariantToListViewArrowRowBuilder::try_new(
-                field.clone(),
-                field.data_type(),
-                cast_options,
-                capacity,
-            )?),
-            DataType::LargeListView(field) => {
-                LargeListView(VariantToListViewArrowRowBuilder::try_new(
-                    field.clone(),
-                    field.data_type(),
-                    cast_options,
-                    capacity,
-                )?)
-            }
-            other => {
-                return Err(ArrowError::InvalidArgumentError(format!(
-                    "Casting to {other:?} is not applicable for array Variant types"
-                )));
-            }
-        };
-        Ok(builder)
+        let builder = B::try_new(field, element_data_type, cast_options, capacity)?;
+        Ok(Self {
+            builder: Box::new(builder),
+        })
     }
 
     fn append_null(&mut self) {
-        match self {
-            Self::List(builder) => builder.append_null(),
-            Self::LargeList(builder) => builder.append_null(),
-            Self::ListView(builder) => builder.append_null(),
-            Self::LargeListView(builder) => builder.append_null(),
-        }
+        self.builder.append_null();
     }
 
     fn append_value(&mut self, list: VariantList<'_, '_>) -> Result<()> {
-        match self {
-            Self::List(builder) => builder.append_value(list),
-            Self::LargeList(builder) => builder.append_value(list),
-            Self::ListView(builder) => builder.append_value(list),
-            Self::LargeListView(builder) => builder.append_value(list),
-        }
+        self.builder.append_value(list)
     }
 
     fn finish(self) -> Result<ArrayRef> {
-        match self {
-            Self::List(builder) => builder.finish(),
-            Self::LargeList(builder) => builder.finish(),
-            Self::ListView(builder) => builder.finish(),
-            Self::LargeListView(builder) => builder.finish(),
-        }
+        self.builder.finish()
     }
+}
+
+trait ListLikeArrayBuilder<'a>: 'a {
+    fn try_new(
+        field: FieldRef,
+        element_data_type: &'a DataType,
+        cast_options: &'a CastOptions,
+        capacity: usize,
+    ) -> Result<Self>
+    where
+        Self: Sized;
+
+    fn append_null(&mut self);
+
+    fn append_value(&mut self, list: VariantList<'_, '_>) -> Result<()>;
+
+    fn finish(self: Box<Self>) -> Result<ArrayRef>;
 }
 
 struct VariantToListArrowRowBuilder<'a, O: OffsetSizeTrait + ArrowNativeTypeOp> {
@@ -395,7 +393,9 @@ struct VariantToListArrowRowBuilder<'a, O: OffsetSizeTrait + ArrowNativeTypeOp> 
     current_offset: O,
 }
 
-impl<'a, O: OffsetSizeTrait + ArrowNativeTypeOp> VariantToListArrowRowBuilder<'a, O> {
+impl<'a, O: OffsetSizeTrait + ArrowNativeTypeOp> ListLikeArrayBuilder<'a>
+    for VariantToListArrowRowBuilder<'a, O>
+{
     fn try_new(
         field: FieldRef,
         element_data_type: &'a DataType,
@@ -438,22 +438,29 @@ impl<'a, O: OffsetSizeTrait + ArrowNativeTypeOp> VariantToListArrowRowBuilder<'a
         Ok(())
     }
 
-    fn finish(mut self) -> Result<ArrayRef> {
-        let (value, typed_value, nulls) = self.element_builder.finish()?;
+    fn finish(self: Box<Self>) -> Result<ArrayRef> {
+        let Self {
+            field,
+            offsets,
+            element_builder,
+            mut nulls,
+            current_offset: _,
+        } = *self;
+        let (value, typed_value, element_nulls) = element_builder.finish()?;
         let element_array =
-            ShreddedVariantFieldArray::from_parts(Some(value), Some(typed_value), nulls);
+            ShreddedVariantFieldArray::from_parts(Some(value), Some(typed_value), element_nulls);
         let field = Arc::new(
-            self.field
+            field
                 .as_ref()
                 .clone()
                 .with_data_type(element_array.data_type().clone()),
         );
-        let offsets = OffsetBuffer::<O>::new(ScalarBuffer::from(self.offsets));
+        let offsets = OffsetBuffer::<O>::new(ScalarBuffer::from(offsets));
         let list_array = GenericListArray::<O>::new(
             field,
             offsets,
             ArrayRef::from(element_array),
-            self.nulls.finish(),
+            nulls.finish(),
         );
         Ok(Arc::new(list_array))
     }
@@ -468,7 +475,9 @@ struct VariantToListViewArrowRowBuilder<'a, O: OffsetSizeTrait + ArrowNativeType
     current_offset: O,
 }
 
-impl<'a, O: OffsetSizeTrait + ArrowNativeTypeOp> VariantToListViewArrowRowBuilder<'a, O> {
+impl<'a, O: OffsetSizeTrait + ArrowNativeTypeOp> ListLikeArrayBuilder<'a>
+    for VariantToListViewArrowRowBuilder<'a, O>
+{
     fn try_new(
         field: FieldRef,
         element_data_type: &'a DataType,
@@ -509,24 +518,32 @@ impl<'a, O: OffsetSizeTrait + ArrowNativeTypeOp> VariantToListViewArrowRowBuilde
         Ok(())
     }
 
-    fn finish(mut self) -> Result<ArrayRef> {
-        let (value, typed_value, nulls) = self.element_builder.finish()?;
+    fn finish(self: Box<Self>) -> Result<ArrayRef> {
+        let Self {
+            field,
+            offsets,
+            sizes,
+            element_builder,
+            mut nulls,
+            current_offset: _,
+        } = *self;
+        let (value, typed_value, element_nulls) = element_builder.finish()?;
         let element_array =
-            ShreddedVariantFieldArray::from_parts(Some(value), Some(typed_value), nulls);
+            ShreddedVariantFieldArray::from_parts(Some(value), Some(typed_value), element_nulls);
         let field = Arc::new(
-            self.field
+            field
                 .as_ref()
                 .clone()
                 .with_data_type(element_array.data_type().clone()),
         );
-        let offsets = ScalarBuffer::from(self.offsets);
-        let sizes = ScalarBuffer::from(self.sizes);
+        let offsets = ScalarBuffer::from(offsets);
+        let sizes = ScalarBuffer::from(sizes);
         let list_view_array = GenericListViewArray::<O>::new(
             field,
             offsets,
             sizes,
             ArrayRef::from(element_array),
-            self.nulls.finish(),
+            nulls.finish(),
         );
         Ok(Arc::new(list_view_array))
     }
