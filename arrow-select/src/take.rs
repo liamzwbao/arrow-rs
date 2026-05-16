@@ -26,10 +26,10 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::*;
 use arrow_buffer::{
-    ArrowNativeType, BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer,
-    bit_util,
+    ArrowNativeType, BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, RunEndBuffer,
+    ScalarBuffer, bit_util,
 };
-use arrow_data::{ArrayDataBuilder, transform::MutableArrayData};
+use arrow_data::transform::MutableArrayData;
 use arrow_schema::{ArrowError, DataType, FieldRef, UnionMode};
 
 use num_traits::Zero;
@@ -685,18 +685,17 @@ where
         "New offsets was filled under/over the expected capacity"
     );
 
-    let child_data = array_data.freeze();
-    let value_offsets = Buffer::from_vec(new_offsets);
+    let field = match values.data_type() {
+        DataType::List(field) | DataType::LargeList(field) => field.clone(),
+        _ => unreachable!(),
+    };
+    // SAFETY: `new_offsets` starts at 0 and is monotonically increasing by construction.
+    let offsets = unsafe { OffsetBuffer::new_unchecked(new_offsets.into()) };
+    let values = make_array(array_data.freeze());
 
-    let list_data = ArrayDataBuilder::new(values.data_type().clone())
-        .len(indices.len())
-        .nulls(nulls)
-        .offset(0)
-        .add_child_data(child_data)
-        .add_buffer(value_offsets);
-
-    let list_data = unsafe { list_data.build_unchecked() };
-    Ok(GenericListArray::<OffsetType::Native>::from(list_data))
+    Ok(GenericListArray::<OffsetType::Native>::new(
+        field, offsets, values, nulls,
+    ))
 }
 
 fn take_list_view<IndexType, OffsetType>(
@@ -712,18 +711,23 @@ where
     let taken_sizes = take_native(values.sizes(), indices);
     let nulls = take_nulls(values.nulls(), indices);
 
-    let list_view_data = ArrayDataBuilder::new(values.data_type().clone())
-        .len(indices.len())
-        .nulls(nulls)
-        .buffers(vec![taken_offsets.into(), taken_sizes.into()])
-        .child_data(vec![values.values().to_data()]);
+    let field = match values.data_type() {
+        DataType::ListView(field) | DataType::LargeListView(field) => field.clone(),
+        _ => unreachable!(),
+    };
+    let offsets = ScalarBuffer::new(taken_offsets.into(), 0, indices.len());
+    let sizes = ScalarBuffer::new(taken_sizes.into(), 0, indices.len());
 
-    // SAFETY: all buffers and child nodes for ListView added in constructor
-    let list_view_data = unsafe { list_view_data.build_unchecked() };
-
-    Ok(GenericListViewArray::<OffsetType::Native>::from(
-        list_view_data,
-    ))
+    // SAFETY: offsets and sizes are taken from a valid ListViewArray and indices are bounds-checked.
+    Ok(unsafe {
+        GenericListViewArray::<OffsetType::Native>::new_unchecked(
+            field,
+            offsets,
+            sizes,
+            values.values().clone(),
+            nulls,
+        )
+    })
 }
 
 /// `take` implementation for `FixedSizeListArray`
@@ -754,15 +758,22 @@ fn take_fixed_size_list<IndexType: ArrowPrimitiveType>(
         }
     }
 
-    let list_data = ArrayDataBuilder::new(values.data_type().clone())
-        .len(indices.len())
-        .null_bit_buffer(Some(null_buf.into()))
-        .offset(0)
-        .add_child_data(taken.into_data());
+    let field = match values.data_type() {
+        DataType::FixedSizeList(field, _) => field.clone(),
+        _ => unreachable!(),
+    };
+    let nulls = Some(NullBuffer::new(BooleanBuffer::new(
+        null_buf.into(),
+        0,
+        indices.len(),
+    )));
 
-    let list_data = unsafe { list_data.build_unchecked() };
-
-    Ok(FixedSizeListArray::from(list_data))
+    Ok(FixedSizeListArray::new(
+        field,
+        values.value_length(),
+        taken,
+        nulls,
+    ))
 }
 
 /// The take kernel implementation for `FixedSizeBinaryArray`.
@@ -790,14 +801,7 @@ fn take_fixed_size_binary<IndexType: ArrowPrimitiveType>(
 
     let value_nulls = take_nulls(values.nulls(), indices);
     let final_nulls = NullBuffer::union(value_nulls.as_ref(), indices.nulls());
-    let array_data = ArrayDataBuilder::new(DataType::FixedSizeBinary(size))
-        .len(indices.len())
-        .nulls(final_nulls)
-        .offset(0)
-        .add_buffer(result_buffer)
-        .build()?;
-
-    return Ok(FixedSizeBinaryArray::from(array_data));
+    return FixedSizeBinaryArray::try_new(size, result_buffer, final_nulls);
 
     /// Implementation of the take kernel for fixed size binary arrays.
     #[inline(never)]
@@ -945,39 +949,24 @@ fn take_run<T: RunEndIndexType, I: ArrowPrimitiveType>(
     take_value_indices
         .append(I::Native::from_usize(physical_indices[physical_indices.len() - 1]).unwrap());
     new_run_ends_builder.append(T::Native::from_usize(physical_indices.len()).unwrap());
-    let new_run_ends = unsafe {
-        // Safety:
-        // The function builds a valid run_ends array and hence need not be validated.
-        ArrayDataBuilder::new(T::DATA_TYPE)
-            .len(new_physical_len)
-            .null_count(0)
-            .add_buffer(new_run_ends_builder.finish())
-            .build_unchecked()
-    };
+    let new_run_ends = PrimitiveArray::<T>::new(
+        ScalarBuffer::new(new_run_ends_builder.finish(), 0, new_physical_len),
+        None,
+    );
 
-    let take_value_indices: PrimitiveArray<I> = unsafe {
-        // Safety:
-        // The function builds a valid take_value_indices array and hence need not be validated.
-        ArrayDataBuilder::new(I::DATA_TYPE)
-            .len(new_physical_len)
-            .null_count(0)
-            .add_buffer(take_value_indices.finish())
-            .build_unchecked()
-            .into()
-    };
+    let take_value_indices = PrimitiveArray::<I>::new(
+        ScalarBuffer::new(take_value_indices.finish(), 0, new_physical_len),
+        None,
+    );
 
     let new_values = take(run_array.values(), &take_value_indices, None)?;
 
-    let builder = ArrayDataBuilder::new(run_array.data_type().clone())
-        .len(physical_indices.len())
-        .add_child_data(new_run_ends)
-        .add_child_data(new_values.into_data());
-    let array_data = unsafe {
-        // Safety:
-        //  This function builds a valid run array and hence can skip validation.
-        builder.build_unchecked()
+    // SAFETY: run ends are strictly increasing and cover `physical_indices.len()` by construction.
+    let run_ends = unsafe {
+        RunEndBuffer::new_unchecked(new_run_ends.into_parts().1, 0, physical_indices.len())
     };
-    Ok(array_data.into())
+    // SAFETY: run ends and values have matching physical lengths and preserve the original data type.
+    Ok(unsafe { RunArray::new_unchecked(run_array.data_type().clone(), run_ends, new_values) })
 }
 
 /// Takes/filters a fixed size list array's inner data using the offsets of the list array.
